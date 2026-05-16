@@ -1,0 +1,33 @@
+# Secrets / local environment
+.env
+.env.*
+!.env.example
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.python-version
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# repo-intel generated stores
+.repo-intel/
+knowledge.db
+chroma/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
