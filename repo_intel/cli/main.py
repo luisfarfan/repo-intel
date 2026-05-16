@@ -83,6 +83,7 @@ def ask(target: str, question: str, limit: int | None = None) -> None:
 
     console.rule("Answer")
     console.print(f"[cyan]Intent:[/cyan] {result.get('intent', 'unknown')}")
+    console.print(f"[cyan]Cached:[/cyan] {'yes' if result.get('cached') else 'no'}")
     console.print(result["answer"])
     console.rule("Sources")
     table = Table()

@@ -93,3 +93,21 @@ class IngestionRunRecord(BaseModel):
     embeddings_count: int = 0
     errors: list[str] = Field(default_factory=list)
 
+
+class AskCacheRecord(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    question: str
+    normalized_question: str
+    answer: str
+    intent: str
+    sources: list[dict[str, Any]] = Field(default_factory=list)
+    selected_chunk_ids: list[str] = Field(default_factory=list)
+    knowledge_fingerprint: str
+    model_provider: str
+    model: str
+    context_chunks: int
+    created_at: datetime
+    last_hit_at: datetime | None = None
+    hit_count: int = 0

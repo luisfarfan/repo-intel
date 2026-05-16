@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engin
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from repo_intel.domain.models import (
+    AskCacheRecord,
     DocumentVersionRecord,
     EmbeddingRecord,
     IngestionRunRecord,
@@ -100,6 +102,25 @@ class IngestionRunRow(Base):
     errors_json: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class AskCacheRow(Base):
+    __tablename__ = "ask_cache"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str] = mapped_column(Text, nullable=False)
+    intent: Mapped[str] = mapped_column(String, nullable=False)
+    sources_json: Mapped[str] = mapped_column(Text, nullable=False)
+    selected_chunk_ids_json: Mapped[str] = mapped_column(Text, nullable=False)
+    knowledge_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    model_provider: Mapped[str] = mapped_column(String, nullable=False)
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    context_chunks: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_hit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    hit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
 class KnowledgeStore:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,6 +185,7 @@ class KnowledgeStore:
                 "chunks": session.query(SemanticChunkRow).count(),
                 "embeddings": session.query(EmbeddingRow).count(),
                 "ingestion_runs": session.query(IngestionRunRow).count(),
+                "ask_cache": session.query(AskCacheRow).count(),
             }
 
     def latest_run(self) -> IngestionRunRecord | None:
@@ -179,6 +201,66 @@ class KnowledgeStore:
         with self.Session() as session:
             rows = session.scalars(select(SemanticChunkRow)).all()
             return [chunk_from_row(row) for row in rows]
+
+    def knowledge_fingerprint(self) -> str:
+        self.init_schema()
+        with self.Session() as session:
+            latest = session.scalars(
+                select(IngestionRunRow).order_by(IngestionRunRow.started_at.desc()).limit(1)
+            ).first()
+            payload = {
+                "latest_run": latest.id if latest else None,
+                "latest_finished_at": latest.finished_at.isoformat() if latest and latest.finished_at else None,
+                "repositories": session.query(RepositoryRow).count(),
+                "documents": session.query(SddDocumentRow).count(),
+                "chunks": session.query(SemanticChunkRow).count(),
+                "embeddings": session.query(EmbeddingRow).count(),
+                "chunk_hashes": [
+                    row[0]
+                    for row in session.query(SemanticChunkRow.content_hash)
+                    .order_by(SemanticChunkRow.id)
+                    .all()
+                ],
+            }
+        return hashlib.sha256(dumps(payload).encode("utf-8")).hexdigest()
+
+    def get_ask_cache(
+        self,
+        normalized_question: str,
+        knowledge_fingerprint: str,
+        model_provider: str,
+        model: str,
+        context_chunks: int,
+    ) -> AskCacheRecord | None:
+        self.init_schema()
+        with self.Session() as session:
+            row = session.scalars(
+                select(AskCacheRow)
+                .where(AskCacheRow.normalized_question == normalized_question)
+                .where(AskCacheRow.knowledge_fingerprint == knowledge_fingerprint)
+                .where(AskCacheRow.model_provider == model_provider)
+                .where(AskCacheRow.model == model)
+                .where(AskCacheRow.context_chunks == context_chunks)
+                .order_by(AskCacheRow.created_at.desc())
+                .limit(1)
+            ).first()
+            return ask_cache_from_row(row) if row else None
+
+    def put_ask_cache(self, record: AskCacheRecord) -> None:
+        self.init_schema()
+        with self.Session.begin() as session:
+            session.merge(ask_cache_to_row(record))
+
+    def touch_ask_cache(self, cache_id: str) -> AskCacheRecord | None:
+        self.init_schema()
+        with self.Session.begin() as session:
+            row = session.get(AskCacheRow, cache_id)
+            if not row:
+                return None
+            row.last_hit_at = utcnow()
+            row.hit_count += 1
+            session.merge(row)
+            return ask_cache_from_row(row)
 
 
 def utcnow() -> datetime:
@@ -272,6 +354,25 @@ def run_to_row(run: IngestionRunRecord) -> IngestionRunRow:
     )
 
 
+def ask_cache_to_row(record: AskCacheRecord) -> AskCacheRow:
+    return AskCacheRow(
+        id=record.id,
+        question=record.question,
+        normalized_question=record.normalized_question,
+        answer=record.answer,
+        intent=record.intent,
+        sources_json=dumps(record.sources),
+        selected_chunk_ids_json=dumps(record.selected_chunk_ids),
+        knowledge_fingerprint=record.knowledge_fingerprint,
+        model_provider=record.model_provider,
+        model=record.model,
+        context_chunks=record.context_chunks,
+        created_at=record.created_at,
+        last_hit_at=record.last_hit_at,
+        hit_count=record.hit_count,
+    )
+
+
 def chunk_from_row(row: SemanticChunkRow) -> SemanticChunkRecord:
     return SemanticChunkRecord(
         id=row.id,
@@ -297,4 +398,23 @@ def run_from_row(row: IngestionRunRow) -> IngestionRunRecord:
         chunks_count=row.chunks_count,
         embeddings_count=row.embeddings_count,
         errors=loads(row.errors_json) or [],
+    )
+
+
+def ask_cache_from_row(row: AskCacheRow) -> AskCacheRecord:
+    return AskCacheRecord(
+        id=row.id,
+        question=row.question,
+        normalized_question=row.normalized_question,
+        answer=row.answer,
+        intent=row.intent,
+        sources=loads(row.sources_json) or [],
+        selected_chunk_ids=loads(row.selected_chunk_ids_json) or [],
+        knowledge_fingerprint=row.knowledge_fingerprint,
+        model_provider=row.model_provider,
+        model=row.model,
+        context_chunks=row.context_chunks,
+        created_at=row.created_at,
+        last_hit_at=row.last_hit_at,
+        hit_count=row.hit_count,
     )

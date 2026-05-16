@@ -412,6 +412,8 @@ def write_answer_plan_debug(
     selected: list[dict],
     semantic_candidates: list[dict] | None = None,
     lexical_candidates: list[dict] | None = None,
+    cache_hit: bool = False,
+    cache_id: str | None = None,
 ) -> None:
     artifact_dir = workspace / ".repo-intel" / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -425,6 +427,8 @@ def write_answer_plan_debug(
         "candidate_limit": plan.candidate_limit,
         "final_limit": plan.final_limit,
         "include_brief": plan.include_brief,
+        "cache_hit": cache_hit,
+        "cache_id": cache_id,
         "semantic_candidates": [debug_result(item) for item in semantic_candidates or []],
         "lexical_candidates": [debug_result(item) for item in lexical_candidates or []],
         "candidates": [debug_result(item) for item in candidates],

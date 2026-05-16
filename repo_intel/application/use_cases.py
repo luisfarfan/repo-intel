@@ -11,11 +11,13 @@ from repo_intel.application.answer_engine import (
     build_retrieval_plan,
     classify_question,
     merge_candidates,
+    normalize,
     retrieve_lexical_candidates,
     write_answer_plan_debug,
 )
 from repo_intel.core.config import load_config, resolve_workspace_path, write_default_config
 from repo_intel.domain.models import (
+    AskCacheRecord,
     EmbeddingRecord,
     IngestionRunRecord,
     RepositoryRecord,
@@ -151,6 +153,34 @@ class SddKnowledgeService:
 
         intent = classify_question(question)
         plan = build_retrieval_plan(intent, limit, self.config.llm.context_chunks)
+        normalized_question = normalize(question.strip())
+        knowledge_fingerprint = self.store.knowledge_fingerprint()
+        cached = self.store.get_ask_cache(
+            normalized_question=normalized_question,
+            knowledge_fingerprint=knowledge_fingerprint,
+            model_provider=self.config.llm.provider,
+            model=self.config.llm.model,
+            context_chunks=self.config.llm.context_chunks,
+        )
+        if cached:
+            touched = self.store.touch_ask_cache(cached.id) or cached
+            write_answer_plan_debug(
+                self.workspace,
+                question,
+                plan,
+                [],
+                [],
+                cache_hit=True,
+                cache_id=touched.id,
+            )
+            return {
+                "answer": touched.answer,
+                "sources": touched.sources,
+                "intent": touched.intent,
+                "cached": True,
+                "cache_id": touched.id,
+            }
+
         semantic_candidates = self.query(question, limit=plan.candidate_limit)
         lexical_candidates = retrieve_lexical_candidates(
             self.workspace,
@@ -167,6 +197,7 @@ class SddKnowledgeService:
             results,
             semantic_candidates=semantic_candidates,
             lexical_candidates=lexical_candidates,
+            cache_hit=False,
         )
         prompt = build_answer_prompt(
             project_name=self.config.project_name,
@@ -179,10 +210,30 @@ class SddKnowledgeService:
             temperature=self.config.llm.temperature,
             num_predict=self.config.llm.num_predict,
         )
+        answer = sanitize_answer(client.generate(prompt))
+        sources = format_sources(results)
+        cache_record = AskCacheRecord(
+            id=f"ask-cache:{uuid.uuid4()}",
+            question=question,
+            normalized_question=normalized_question,
+            answer=answer,
+            intent=intent.name,
+            sources=sources,
+            selected_chunk_ids=[str(result.get("id", "")) for result in results],
+            knowledge_fingerprint=knowledge_fingerprint,
+            model_provider=self.config.llm.provider,
+            model=self.config.llm.model,
+            context_chunks=self.config.llm.context_chunks,
+            created_at=utcnow(),
+            hit_count=0,
+        )
+        self.store.put_ask_cache(cache_record)
         return {
-            "answer": sanitize_answer(client.generate(prompt)),
-            "sources": format_sources(results),
+            "answer": answer,
+            "sources": sources,
             "intent": intent.name,
+            "cached": False,
+            "cache_id": cache_record.id,
         }
 
     def brief(self, refresh_scan: bool = False) -> Path:
