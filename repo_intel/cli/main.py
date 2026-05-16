@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+from typing import Annotated
+
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from repo_intel.cli import obsidian, workspace
+from repo_intel.cli import config, notebooklm, obsidian, workspace
+from repo_intel.cli.setup import run_setup
 from repo_intel.application.use_cases import SddKnowledgeService
 from repo_intel.platform.workspace import WorkspaceResolutionError, resolve_workspace_path
 
 
 app = typer.Typer(help="SDD-only engineering knowledge ingestion CLI.")
+app.add_typer(config.app, name="config")
+app.add_typer(notebooklm.app, name="notebooklm")
 app.add_typer(obsidian.app, name="obsidian")
 app.add_typer(workspace.app, name="workspace")
 console = Console()
@@ -21,6 +26,31 @@ def init(target: str) -> None:
     service = service_for_target(target)
     path = service.init()
     console.print(f"[green]Initialized[/green] {path}")
+
+
+@app.command()
+def setup(
+    preset: Annotated[
+        str | None,
+        typer.Option(help="Setup preset: local, remote-ollama, minimal, or proxima."),
+    ] = None,
+    ollama_url: str | None = None,
+    embedding_model: str | None = None,
+    llm_model: str | None = None,
+    openrouter_api_key: str | None = None,
+    openrouter_model: str | None = None,
+    non_interactive: bool = False,
+) -> None:
+    """Configure portable global defaults for the repo-intel CLI."""
+    run_setup(
+        preset=preset,
+        ollama_url=ollama_url,
+        embedding_model=embedding_model,
+        llm_model=llm_model,
+        openrouter_api_key=openrouter_api_key,
+        openrouter_model=openrouter_model,
+        non_interactive=non_interactive,
+    )
 
 
 @app.command()

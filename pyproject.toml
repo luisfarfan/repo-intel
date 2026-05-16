@@ -17,6 +17,11 @@ dependencies = [
   "watchdog>=6.0.0",
 ]
 
+[project.optional-dependencies]
+notebooklm = [
+  "notebooklm-py[browser]>=0.4.1",
+]
+
 [project.scripts]
 repo-intel = "repo_intel.cli.main:main"
 

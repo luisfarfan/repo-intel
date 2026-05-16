@@ -28,3 +28,11 @@ def ensure_repo_intel_home() -> Path:
 
 def workspaces_registry_path() -> Path:
     return repo_intel_home() / "workspaces.json"
+
+
+def global_config_path() -> Path:
+    return repo_intel_home() / "config.toml"
+
+
+def global_env_path() -> Path:
+    return repo_intel_home() / ".env"

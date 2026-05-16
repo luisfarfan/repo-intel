@@ -12,6 +12,7 @@ from repo_intel.domain.models import (
     AskCacheRecord,
     DocumentVersionRecord,
     EmbeddingRecord,
+    GitDocumentMetadata,
     IngestionRunRecord,
     RepositoryRecord,
     SddDocumentRecord,
@@ -202,6 +203,18 @@ class KnowledgeStore:
             rows = session.scalars(select(SemanticChunkRow)).all()
             return [chunk_from_row(row) for row in rows]
 
+    def all_repositories(self) -> list[RepositoryRecord]:
+        self.init_schema()
+        with self.Session() as session:
+            rows = session.scalars(select(RepositoryRow).order_by(RepositoryRow.name)).all()
+            return [repo_from_row(row) for row in rows]
+
+    def all_documents(self) -> list[SddDocumentRecord]:
+        self.init_schema()
+        with self.Session() as session:
+            rows = session.scalars(select(SddDocumentRow).order_by(SddDocumentRow.relative_path)).all()
+            return [doc_from_row(row) for row in rows]
+
     def knowledge_fingerprint(self) -> str:
         self.init_schema()
         with self.Session() as session:
@@ -300,6 +313,34 @@ def doc_to_row(doc: SddDocumentRecord) -> SddDocumentRow:
         size_bytes=doc.size_bytes,
         tags_json=dumps(doc.tags),
         git_json=doc.git.model_dump_json(),
+    )
+
+
+def repo_from_row(row: RepositoryRow) -> RepositoryRecord:
+    return RepositoryRecord(
+        id=row.id,
+        name=row.name,
+        path=row.path,
+        relative_path=row.relative_path,
+        branch=row.branch,
+        git_status=row.git_status,
+        sdd_roots=loads(row.sdd_roots_json) or [],
+    )
+
+
+def doc_from_row(row: SddDocumentRow) -> SddDocumentRecord:
+    return SddDocumentRecord(
+        id=row.id,
+        repository_id=row.repository_id,
+        path=row.path,
+        relative_path=row.relative_path,
+        repo_relative_path=row.repo_relative_path,
+        title=row.title,
+        doc_type=row.doc_type,
+        content_hash=row.content_hash,
+        size_bytes=row.size_bytes,
+        tags=loads(row.tags_json) or [],
+        git=GitDocumentMetadata.model_validate_json(row.git_json),
     )
 
 
