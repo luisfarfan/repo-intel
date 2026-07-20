@@ -133,7 +133,7 @@ def search_docs(
     k = max(1, min(int(k), MAX_SEARCH_K))
 
     service = _current_service()
-    rows = service.query(query, limit=k)
+    rows = service.search(query, limit=k)
     return {
         "query": query,
         "count": len(rows),

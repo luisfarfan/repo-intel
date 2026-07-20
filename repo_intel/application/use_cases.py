@@ -12,6 +12,7 @@ from repo_intel.application.answer_engine import (
     classify_question,
     merge_candidates,
     normalize,
+    rerank_results,
     retrieve_lexical_candidates,
     write_answer_plan_debug,
 )
@@ -239,6 +240,32 @@ class SddKnowledgeService:
                 }
             )
         return rows
+
+    def search(self, question: str, limit: int = 8) -> list[dict]:
+        """Hybrid retrieval: the same semantic+lexical blend `ask` feeds its LLM.
+
+        `query` above is the pure-vector half and stays that way — `ask` composes it with the
+        lexical half itself, so making `query` hybrid would merge twice. But everything else
+        that retrieves (the `query` CLI command, the MCP `search_docs` tool) was calling the
+        vector half directly and therefore never saw a lexical hit.
+
+        That gap is not academic: dense retrieval on this corpus ranks a guardrail about
+        Alembic revision ids below unrelated docs even when the query quotes it almost
+        verbatim, while the lexical side matches the literal terms instantly. `ask` answered
+        such questions correctly and `search_docs` returned nothing useful for the same
+        question — the difference was entirely this missing merge.
+        """
+        # Build the plan off the engine's own default, NOT off `limit`. `limit` is how many
+        # rows the caller wants BACK; using it as the candidate pool too means we retrieve a
+        # handful and then "rerank" them, which cannot surface anything the initial fetch
+        # missed. `ask` gets this right by planning from config.llm.context_chunks, and that
+        # is exactly why `ask` found the Alembic guardrail while a 6-row search did not.
+        # Fetch wide, rerank, then truncate.
+        plan = build_retrieval_plan(classify_question(question), None, self.config.llm.context_chunks)
+        semantic = self.query(question, limit=max(limit, plan.candidate_limit))
+        lexical = retrieve_lexical_candidates(self.workspace, question, limit=plan.lexical_limit)
+        merged = merge_candidates(semantic, lexical)
+        return rerank_results(question, merged, plan)[:limit]
 
     def ask(self, question: str, limit: int | None = None) -> dict:
         from repo_intel.enrichers.factory import build_ask_client

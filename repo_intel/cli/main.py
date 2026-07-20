@@ -138,7 +138,7 @@ def query(target: str, question: str, limit: int = 8) -> None:
     """Run semantic retrieval over indexed SDD chunks."""
     service = service_for_target(target)
     try:
-        results = service.query(question, limit=limit)
+        results = service.search(question, limit=limit)
     except Exception as exc:
         console.print(f"[red]Query failed:[/red] {exc}")
         raise typer.Exit(1) from exc

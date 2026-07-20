@@ -24,8 +24,14 @@ class StubService:
         self.ask_calls: list[tuple[str, int | None]] = []
 
     def query(self, question, limit=8):
+        """Pure-vector half. `ask` composes this with the lexical half itself."""
         self.query_calls.append((question, limit))
         return self._rows
+
+    def search(self, question, limit=8):
+        """Hybrid retrieval — what `search_docs` must use, so a lexical-only hit is
+        reachable through the MCP and not just through `ask`."""
+        return self.query(question, limit)
 
     def ask(self, question, limit=None):
         self.ask_calls.append((question, limit))
