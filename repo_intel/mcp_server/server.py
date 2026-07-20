@@ -79,8 +79,51 @@ def _service(target: str):
     return SddKnowledgeService(path)
 
 
+# Version of the on-disk index that Chroma's process-level client cache is currently valid
+# for. `None` until the first request stamps it.
+_chroma_valid_for: str | None = None
+
+
+def _index_version(service) -> str:
+    """A cheap, always-fresh fingerprint of the on-disk index.
+
+    Reads the latest ingestion run through a new SQLite session (the store opens one per
+    call, so this never goes stale the way the Chroma client does). Two reindexes are
+    distinguished by run id AND finish time, so even a re-run that reused the id would show
+    as changed.
+    """
+    run = service.store.latest_run()
+    if run is None:
+        return "empty"
+    finished = getattr(run, "finished_at", None)
+    return f"{run.id}:{finished.isoformat() if finished else 'running'}"
+
+
 def _current_service():
-    return _service(_workspace_target())
+    """Return the workspace service, refreshing Chroma's view if the index was rebuilt.
+
+    The bug this closes: this server is a long-lived reader, while `repo-intel ingest` (run
+    by the post-commit hook or by hand) rewrites the Chroma collection on disk from a
+    separate process. chromadb caches its client per path for the life of THIS process, so
+    without intervention the server keeps answering from the vectors it first loaded — a
+    reindex is invisible, silently, with no error. SQLite reads are already fresh (new
+    session per call), so only Chroma needs the nudge.
+
+    Steady state costs one indexed single-row SQLite read per request. Only when the
+    fingerprint actually changes do we clear chromadb's cache, so the next
+    `PersistentClient(path)` (query() builds one per call) re-reads disk.
+    """
+    global _chroma_valid_for
+    service = _service(_workspace_target())
+    version = _index_version(service)
+    if version != _chroma_valid_for:
+        import chromadb
+
+        chromadb.api.shared_system_client.SharedSystemClient.clear_system_cache()
+        if _chroma_valid_for is not None:
+            _log(f"index changed ({_chroma_valid_for} -> {version}); refreshed Chroma view")
+        _chroma_valid_for = version
+    return service
 
 
 def _clip(text: str, max_chars: int) -> tuple[str, bool]:

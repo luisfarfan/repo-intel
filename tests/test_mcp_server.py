@@ -217,3 +217,70 @@ def test_knowledge_status_without_any_run(stub):
     payload = call("knowledge_status").structured_content
     assert payload["latest_run_id"] is None
     assert payload["latest_finished_at"] is None
+
+
+# --- stale-index refresh (the reindex-invisible bug) ------------------------
+
+
+class _Run:
+    def __init__(self, run_id, finished_at):
+        self.id = run_id
+        self.finished_at = finished_at
+
+
+class _Store:
+    def __init__(self, run):
+        self._run = run
+
+    def latest_run(self):
+        return self._run
+
+
+class _VersionedService:
+    def __init__(self, run):
+        self.store = _Store(run)
+
+
+def test_index_version_distinguishes_reruns():
+    import datetime as dt
+
+    ts = dt.datetime(2026, 7, 20, 11, 41, 7)
+    v1 = mcp_server._index_version(_VersionedService(_Run("run:a", ts)))
+    v2 = mcp_server._index_version(_VersionedService(_Run("run:b", ts)))  # new id
+    v3 = mcp_server._index_version(_VersionedService(_Run("run:a", ts.replace(second=8))))  # same id, later finish
+    empty = mcp_server._index_version(_VersionedService(None))
+    assert len({v1, v2, v3}) == 3
+    assert empty == "empty"
+
+
+def test_current_service_clears_chroma_cache_only_when_index_changes(monkeypatch):
+    """Steady state must not clear the cache every call; a reindex must clear it exactly once."""
+    import datetime as dt
+
+    runs = [_Run("run:a", dt.datetime(2026, 7, 20, 11, 41, 7))]
+    monkeypatch.setattr(mcp_server, "_service", lambda target: _VersionedService(runs[0]))
+    monkeypatch.setattr(mcp_server, "_workspace_target", lambda: "/ws")
+    monkeypatch.setattr(mcp_server, "_chroma_valid_for", None, raising=False)
+
+    cleared = {"n": 0}
+
+    class _FakeShared:
+        @staticmethod
+        def clear_system_cache():
+            cleared["n"] += 1
+
+    import chromadb.api.shared_system_client as ssc
+
+    monkeypatch.setattr(ssc, "SharedSystemClient", _FakeShared)
+
+    mcp_server._current_service()  # first call: stamps baseline (clears once)
+    assert cleared["n"] == 1
+    mcp_server._current_service()  # unchanged index: must NOT clear again
+    mcp_server._current_service()
+    assert cleared["n"] == 1
+
+    runs[0] = _Run("run:b", dt.datetime(2026, 7, 20, 12, 47, 55))  # reindex happened
+    mcp_server._current_service()
+    assert cleared["n"] == 2  # cleared exactly once for the change
+    mcp_server._current_service()
+    assert cleared["n"] == 2  # and not again
