@@ -12,7 +12,12 @@ from __future__ import annotations
 import pytest
 import requests
 
-from repo_intel.enrichers.ollama_embeddings import MAX_EMBED_CHARS, OllamaEmbeddingClient
+from repo_intel.enrichers.ollama_embeddings import (
+    DOCUMENT_PREFIX,
+    MAX_EMBED_CHARS,
+    QUERY_PREFIX,
+    OllamaEmbeddingClient,
+)
 
 
 class FakeResponse:
@@ -62,7 +67,34 @@ def test_oversized_input_is_capped_before_the_request(monkeypatch: pytest.Monkey
 
     client.embed("a" * 50_000)
 
-    assert len(seen[0]) == MAX_EMBED_CHARS
+    # The BODY is what the cap applies to. nomic models also carry a task prefix, and the
+    # prefix must survive truncation (truncate first, then prefix) — a cap that ate the
+    # prefix would silently drop the model back to its un-prefixed, near-random ranking.
+    assert seen[0].startswith(DOCUMENT_PREFIX)
+    assert len(seen[0]) == len(DOCUMENT_PREFIX) + MAX_EMBED_CHARS
+
+
+def test_query_and_document_get_different_prefixes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mixing the two sides is the failure mode this exists to prevent."""
+    seen = install_fake_post(monkeypatch, ok_response)
+    client = OllamaEmbeddingClient("http://x", "nomic-embed-text")
+
+    client.embed("passage")
+    client.embed_query("question")
+
+    assert seen[0] == f"{DOCUMENT_PREFIX}passage"
+    assert seen[1] == f"{QUERY_PREFIX}question"
+
+
+def test_non_nomic_model_gets_no_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prefixes are nomic-specific; a model not trained with them would be hurt."""
+    seen = install_fake_post(monkeypatch, ok_response)
+    client = OllamaEmbeddingClient("http://x", "mxbai-embed-large")
+
+    client.embed("passage")
+    client.embed_query("question")
+
+    assert seen == ["passage", "question"]
 
 
 def test_context_overflow_is_retried_with_halved_input(monkeypatch: pytest.MonkeyPatch) -> None:

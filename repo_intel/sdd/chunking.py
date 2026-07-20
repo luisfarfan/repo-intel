@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 from repo_intel.core.config import AppConfig
@@ -8,7 +9,24 @@ from repo_intel.domain.models import RepositoryRecord, SddDocumentRecord, Semant
 from repo_intel.sdd.markdown import MarkdownSection, parse_markdown_sections
 
 
-MAX_CHUNK_CHARS = 4200
+# IMPORTANT — changing anything in this module does NOT invalidate the index on its own.
+# Incremental ingest decides what to rebuild from each document's sha256, so if the source
+# files have not changed, a new chunking strategy is silently never applied: `ingest` will
+# report "0 changed, 0 rebuilt" and retrieval keeps using the old chunk boundaries. After
+# touching the constants or the splitter, you MUST run `repo-intel ingest <target> --full`.
+# (A chunker fingerprint stored alongside the index would make this automatic — see the
+# known-issues section of the README.)
+#
+# Ceiling for a single embedded chunk. Was 4200, which is far too permissive: one vector
+# has to represent everything in the chunk, so a heterogeneous section averages out into a
+# vector that matches nothing specific. Measured on the real corpus: the AGENTS.md section
+# "Convenciones de código" (1749 chars: async repos + exception prefixes + Pydantic
+# validators + Alembic revision-id rules) scored 0.684 against a query about Alembic
+# revision ids, while the 702-char fragment carrying only that rule scored 0.783 — enough
+# to move it from "absent from the results" to top-hit. 1200 sits just above the p95 of the
+# existing corpus (1134), so well-scoped sections are untouched and only the grab-bag ones
+# get split.
+MAX_CHUNK_CHARS = 1200
 MIN_CHUNK_CHARS = 200
 # Floor for the whole-document fallback below. Lower than MIN_CHUNK_CHARS on purpose:
 # rejecting a section of a rich document is cheap, but rejecting a document outright
@@ -73,12 +91,46 @@ def chunk_document(
     return chunks
 
 
+_TOP_LEVEL_BULLET = re.compile(r"^(?:[-*+] |\d+[.)] )")
+
+
+def _split_blocks(text: str) -> list[str]:
+    """Split a section into packable blocks.
+
+    Blank lines are the obvious boundary, but the guardrail docs in this corpus are written
+    as one long bullet list under a single heading — each bullet a different rule, no blank
+    lines between them. Splitting on "\\n\\n" alone leaves that whole list as one block, so it
+    gets embedded as one vector and no individual rule is retrievable. A top-level list
+    marker at column 0 is therefore also a boundary; indented continuation lines stay with
+    their bullet, so a multi-line rule is never cut in half.
+    """
+    blocks: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        if current:
+            joined = "\n".join(current).strip()
+            if joined:
+                blocks.append(joined)
+            current.clear()
+
+    for line in text.split("\n"):
+        if not line.strip():
+            flush()
+            continue
+        if current and _TOP_LEVEL_BULLET.match(line):
+            flush()
+        current.append(line)
+    flush()
+    return blocks
+
+
 def split_large_section(section: MarkdownSection) -> list[str]:
     text = section.text.strip()
     if len(text) <= MAX_CHUNK_CHARS:
         return [text]
 
-    paragraphs = text.split("\n\n")
+    paragraphs = _split_blocks(text)
     parts: list[str] = []
     current: list[str] = []
     current_len = 0

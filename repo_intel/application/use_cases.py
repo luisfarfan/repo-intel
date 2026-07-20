@@ -220,7 +220,10 @@ class SddKnowledgeService:
             resolve_workspace_path(self.workspace, self.config.storage.chroma_path),
             self.config.storage.collection,
         )
-        result = vector_index.query(embedder.embed(question), n_results=limit)
+        # embed_query, not embed: the retrieval side needs nomic's "search_query: " prefix.
+        # Embedding the question as if it were a stored passage collapses the score spread
+        # and the ranking degrades to near-random (see ollama_embeddings for the numbers).
+        result = vector_index.query(embedder.embed_query(question), n_results=limit)
         rows: list[dict] = []
         ids = result.get("ids", [[]])[0]
         docs = result.get("documents", [[]])[0]
