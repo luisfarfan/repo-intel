@@ -28,6 +28,18 @@ class ChromaKnowledgeIndex:
             metadatas=[sanitize_metadata(chunk.metadata) for chunk in chunks],
         )
 
+    def delete_chunks(self, chunk_ids: list[str]) -> None:
+        """Drop vectors for chunks that no longer exist.
+
+        Without this, an incremental reindex leaves the vectors of deleted or rewritten
+        sections in the collection forever, and retrieval keeps citing text that is no
+        longer in any document.
+        """
+        if not chunk_ids:
+            return
+        for start in range(0, len(chunk_ids), 400):
+            self.collection.delete(ids=chunk_ids[start : start + 400])
+
     def query(self, embedding: list[float], n_results: int = 8) -> dict[str, Any]:
         return self.collection.query(
             query_embeddings=[embedding],

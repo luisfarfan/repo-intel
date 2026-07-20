@@ -36,9 +36,14 @@ PRUNE_DIRS = {
 def discover_repositories(workspace: Path, config: AppConfig) -> list[RepositoryRecord]:
     workspace = workspace.resolve()
     repositories: list[RepositoryRecord] = []
+    # Explicit allowlist from config (`repos = [...]`). Empty means index everything,
+    # which keeps existing workspaces working unchanged.
+    allowlist = {name.strip() for name in config.repos if name.strip()}
 
     for candidate in iter_candidate_dirs(workspace, max_depth=3):
         if not is_repository_candidate(candidate, workspace):
+            continue
+        if allowlist and candidate.name not in allowlist:
             continue
         rel = candidate.relative_to(workspace).as_posix()
         if rel == ".":
@@ -64,9 +69,19 @@ def discover_sdd_documents(
     workspace: Path,
     config: AppConfig,
     repositories: list[RepositoryRecord],
+    reuse: dict[str, SddDocumentRecord] | None = None,
 ) -> list[SddDocumentRecord]:
+    """Discover SDD documents, reusing git metadata for unchanged files.
+
+    `reuse` maps document id -> previously indexed record. When a file's content hash
+    still matches, its git metadata is copied from that record instead of being
+    recomputed. `document_metadata` runs a `git log -1 -- <path>` walk per document,
+    which dominated scan time (~44s over 933 docs); hashing the file is milliseconds.
+    Pass `reuse=None` (or an empty dict) to force a full recompute.
+    """
     workspace = workspace.resolve()
     documents: list[SddDocumentRecord] = []
+    reuse = reuse or {}
     for repo in repositories:
         repo_path = Path(repo.path)
         git_provider = GitMetadataProvider(repo_path)
@@ -75,11 +90,16 @@ def discover_sdd_documents(
             repo_relative = path.relative_to(repo_path).as_posix()
             content = read_text(path)
             content_hash = sha256_text(content)
-            git_meta = git_provider.document_metadata(path)
+            document_id = stable_id("doc", f"{repo.id}:{repo_relative}")
+            cached = reuse.get(document_id)
+            if cached is not None and cached.content_hash == content_hash:
+                git_meta = cached.git
+            else:
+                git_meta = git_provider.document_metadata(path)
             doc_type, tags = classify_doc(repo_relative)
             documents.append(
                 SddDocumentRecord(
-                    id=stable_id("doc", f"{repo.id}:{repo_relative}"),
+                    id=document_id,
                     repository_id=repo.id,
                     path=str(path),
                     relative_path=relative,

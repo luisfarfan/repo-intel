@@ -94,7 +94,7 @@ def validate_config(cfg: AppConfig, workspace: str | None = None) -> list[tuple[
 
     models = check_ollama(cfg.embeddings.base_url, rows)
     check_model("embedding_model", cfg.embeddings.model, models, rows)
-    check_model("llm_model", cfg.llm.model, models, rows)
+    check_llm(cfg, models, rows)
     check_openrouter(cfg, rows)
     check_notebooklm(cfg, rows)
     return rows
@@ -134,6 +134,13 @@ def env_list() -> None:
 
 def effective_config(workspace: str | None) -> AppConfig:
     if not workspace:
+        # Without an explicit --workspace, prefer the config the *other* commands
+        # actually use. `scan`/`ingest`/`ask` all resolve ./.repo-intel/config.toml
+        # from the cwd; falling straight through to the global config made `doctor`
+        # report on a config nothing else reads (e.g. "llm_provider ollama" while the
+        # workspace was really pointed at cliproxy). Global stays the fallback.
+        if (Path.cwd() / ".repo-intel" / "config.toml").exists():
+            return load_config(Path.cwd())
         return load_global_config()
     try:
         return load_config(resolve_workspace_path(workspace))
@@ -254,6 +261,53 @@ def model_matches(model: str, available_models: set[str]) -> bool:
     if ":" not in model and f"{model}:latest" in available_models:
         return True
     return False
+
+
+def check_llm(cfg: AppConfig, embedding_models: set[str], rows: list[tuple[str, str, str]]) -> None:
+    """Validate the chat LLM against its OWN endpoint.
+
+    Previously the LLM model was checked against the catalogue returned by the
+    embeddings host, which is wrong whenever chat and embeddings live on different
+    services -- exactly the cliproxy setup.
+    """
+    from repo_intel.enrichers.factory import KNOWN_PROVIDERS, NATIVE_OLLAMA_PROVIDERS
+
+    provider = cfg.llm.provider.strip().lower()
+    if provider not in KNOWN_PROVIDERS:
+        rows.append(("llm_provider", "error", f"unknown provider {cfg.llm.provider!r}"))
+        return
+    rows.append(("llm_provider", "ok", f"{provider} -> {cfg.llm.base_url}"))
+
+    if provider in NATIVE_OLLAMA_PROVIDERS:
+        models = (
+            embedding_models
+            if cfg.llm.base_url.rstrip("/") == cfg.embeddings.base_url.rstrip("/")
+            else detect_ollama(cfg.llm.base_url)[2]
+        )
+        check_model("llm_model", cfg.llm.model, models, rows)
+        return
+
+    # OpenAI-compatible gateway: the key must be present and /v1/models must list the model.
+    api_key = os.getenv(cfg.llm.api_key_env)
+    if not api_key:
+        rows.append(("llm_api_key", "error", f"{cfg.llm.api_key_env} is not set (see README)"))
+    else:
+        rows.append(("llm_api_key", "ok", f"{cfg.llm.api_key_env} is set"))
+    try:
+        response = requests.get(
+            f"{cfg.llm.base_url.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+            timeout=5,
+        )
+        response.raise_for_status()
+        names = {str(item.get("id", "")) for item in response.json().get("data", [])}
+        rows.append(("llm_endpoint", "ok", f"{cfg.llm.base_url} ({len(names)} model(s))"))
+        if names and cfg.llm.model not in names:
+            rows.append(("llm_model", "error", f"{cfg.llm.model} not offered by {cfg.llm.base_url}"))
+        else:
+            rows.append(("llm_model", "ok", cfg.llm.model))
+    except Exception as exc:
+        rows.append(("llm_endpoint", "error", f"{cfg.llm.base_url}: {exc}"))
 
 
 def check_openrouter(cfg: AppConfig, rows: list[tuple[str, str, str]]) -> None:

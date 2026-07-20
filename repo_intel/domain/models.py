@@ -93,6 +93,17 @@ class IngestionRunRecord(BaseModel):
     embeddings_count: int = 0
     errors: list[str] = Field(default_factory=list)
 
+    # --- Transient run telemetry (NOT persisted) ---------------------------------
+    # These describe *the work this run did*, whereas the counters above describe
+    # *total corpus coverage*. They are deliberately absent from IngestionRunRow:
+    # the CLI has no migration system, so adding columns would break every existing
+    # knowledge.db. `run_to_row` ignores them by construction.
+    mode: str = "full"
+    documents_changed: int = 0
+    documents_removed: int = 0
+    chunks_created: int = 0
+    embeddings_created: int = 0
+
 
 class AskCacheRecord(BaseModel):
     model_config = ConfigDict(from_attributes=True)

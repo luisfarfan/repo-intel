@@ -32,6 +32,14 @@ class SetupPreset:
     embedding_model: str
     llm_model: str
     configure_optional: bool = True
+    # Chat endpoint. Defaults to the embeddings host (single-Ollama setups); presets
+    # that split embeddings and chat across hosts override it.
+    llm_url: str | None = None
+    llm_provider: str = "ollama"
+
+    @property
+    def chat_url(self) -> str:
+        return self.llm_url or self.ollama_url
 
 
 PRESET_VALUES = {
@@ -51,10 +59,14 @@ PRESET_VALUES = {
         llm_model="phi3:mini",
         configure_optional=False,
     ),
+    # Embeddings stay local (free, private, no network hop); chat goes to the local
+    # cliproxy OpenAI-compatible gateway. The old 192.168.1.12 host is dead.
     "proxima": SetupPreset(
-        ollama_url="http://192.168.1.12:11434",
+        ollama_url="http://127.0.0.1:11434",
         embedding_model="nomic-embed-text:latest",
-        llm_model="qwen2.5:3b",
+        llm_model="gemini-3-flash",
+        llm_url="http://127.0.0.1:8317/v1",
+        llm_provider="cliproxy",
     ),
 }
 
@@ -63,13 +75,19 @@ def run_setup(
     ollama_url: str | None = None,
     embedding_model: str | None = None,
     llm_model: str | None = None,
-    openrouter_api_key: str | None = None,
     openrouter_model: str | None = None,
     non_interactive: bool = False,
     preset: str | None = None,
 ) -> None:
-    """Configure portable global defaults for repo-intel."""
+    """Configure portable global defaults for repo-intel.
+
+    Note the absence of an `openrouter_api_key` parameter: the key is only ever
+    collected by the interactive wizard's hidden prompt, so it cannot reach argv (and
+    therefore `ps` and shell history). Non-interactive callers use
+    `repo-intel config env set OPENROUTER_API_KEY`.
+    """
     ensure_repo_intel_home()
+    openrouter_api_key: str | None = None
     cfg = load_global_config_file()
     interactive = sys.stdin.isatty() and not non_interactive
 
@@ -92,7 +110,6 @@ def run_setup(
             embedding_model=embedding_model,
             llm_model=llm_model,
             openrouter_model=openrouter_model,
-            openrouter_api_key=openrouter_api_key,
         )
     else:
         apply_flag_overrides(
@@ -133,7 +150,8 @@ def normalize_preset(preset: str | None, interactive: bool) -> str:
 def apply_preset(cfg: AppConfig, preset: str) -> None:
     values = PRESET_VALUES[preset]
     cfg.embeddings.base_url = values.ollama_url
-    cfg.llm.base_url = values.ollama_url
+    cfg.llm.base_url = values.chat_url
+    cfg.llm.provider = values.llm_provider
     cfg.embeddings.model = values.embedding_model
     cfg.llm.model = values.llm_model
 
@@ -163,8 +181,8 @@ def run_interactive_wizard(
     embedding_model: str | None,
     llm_model: str | None,
     openrouter_model: str | None,
-    openrouter_api_key: str | None,
 ) -> tuple[AppConfig, str | None]:
+    openrouter_api_key: str | None = None
     console.print(f"[cyan]Preset:[/cyan] {preset}")
 
     configured_url = ollama_url or cfg.embeddings.base_url
@@ -174,14 +192,19 @@ def run_interactive_wizard(
         configured_url = typer.prompt("Ollama URL", default=configured_url)
 
     cfg.embeddings.base_url = configured_url
-    cfg.llm.base_url = configured_url
+    # Only follow the embeddings host for chat when the preset does not point chat
+    # somewhere else (e.g. the cliproxy gateway).
+    if PRESET_VALUES[preset].llm_url is None:
+        cfg.llm.base_url = configured_url
 
     status, detail, models = detect_ollama(configured_url)
     render_ollama_detection(status, detail, models)
 
-    if models:
+    if models and PRESET_VALUES[preset].llm_url is None:
         cfg.embeddings.model = suggested_embedding_model(models)
         cfg.llm.model = suggested_chat_model(models)
+    elif models:
+        cfg.embeddings.model = suggested_embedding_model(models)
     cfg.embeddings.model = typer.prompt(
         "Embedding model",
         default=embedding_model or cfg.embeddings.model,
@@ -197,7 +220,7 @@ def run_interactive_wizard(
             )
             openrouter_api_key = typer.prompt(
                 "OpenRouter API key",
-                default=openrouter_api_key or "",
+                default="",
                 hide_input=True,
                 show_default=False,
             )

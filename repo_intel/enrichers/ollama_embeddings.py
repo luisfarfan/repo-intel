@@ -3,12 +3,46 @@ from __future__ import annotations
 import requests
 
 
+# nomic-embed-text has a 2048-token context. Markdown/code averages well under
+# 4 chars/token, so a chunk can be under any token-ish heuristic and still overflow.
+# A real 7544-char chunk from the PROXIMA corpus returned
+#   400 {"error":"the input length exceeds the context length"}
+# and aborted the whole ingest. This cap is the proactive guard; embed() also
+# retries reactively so a different model's smaller window can't wedge us either.
+MAX_EMBED_CHARS = 6000
+
+
 class OllamaEmbeddingClient:
-    def __init__(self, base_url: str, model: str) -> None:
+    def __init__(self, base_url: str, model: str, max_chars: int = MAX_EMBED_CHARS) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.max_chars = max_chars
 
     def embed(self, text: str) -> list[float]:
+        return self._embed_with_backoff(text[: self.max_chars])
+
+    def _embed_with_backoff(self, text: str) -> list[float]:
+        """Embed, halving the input on context-length overflow.
+
+        Truncating loses the tail of an outsized chunk, which is strictly better than
+        the previous behaviour: a single overflowing chunk raised, and the caller's
+        batch loop stopped, leaving every later chunk unembedded.
+        """
+        attempt = text
+        while True:
+            try:
+                return self._embed_once(attempt)
+            except requests.HTTPError as exc:
+                overflow = (
+                    exc.response is not None
+                    and exc.response.status_code == 400
+                    and "context length" in ollama_error(exc.response).lower()
+                )
+                if not overflow or len(attempt) <= 256:
+                    raise
+                attempt = attempt[: len(attempt) // 2]
+
+    def _embed_once(self, text: str) -> list[float]:
         response = requests.post(
             f"{self.base_url}/api/embed",
             json={"model": self.model, "input": text},

@@ -206,8 +206,20 @@ def rerank_results(question: str, results: list[dict], plan: RetrievalPlan) -> l
 
 
 def load_project_brief_context(workspace: Path) -> dict | None:
+    """The generated project brief, as a synthetic context entry -- if it is still current.
+
+    The brief is a loose file on disk, NOT part of the index: nothing in `ingest`
+    regenerates it. A brief written before the current corpus therefore describes a
+    workspace that no longer exists, and injecting it would put a stale document at the
+    top of the citation list wearing a perfect 0.0000 distance, outranking every real
+    source. Compare it against the chunk artifact, which every ingest rewrites, and drop
+    it once it falls behind rather than presenting it with unearned authority.
+    """
     path = workspace / ".repo-intel" / "briefs" / "project-brief.md"
     if not path.exists():
+        return None
+    index_artifact = workspace / ".repo-intel" / "artifacts" / "chunks.json"
+    if index_artifact.exists() and path.stat().st_mtime < index_artifact.stat().st_mtime:
         return None
     text = path.read_text(encoding="utf-8", errors="ignore")
     return {
@@ -238,7 +250,13 @@ def build_answer_context(
         brief = load_project_brief_context(workspace)
         if brief:
             selected.append(brief)
-        selected.extend(load_overview_chunks(workspace, limit=plan.final_limit))
+        # Cap the deterministic block so semantic retrieval always keeps a seat. It used
+        # to be given `final_limit` slots, which filled the budget on its own and left
+        # `ranked` to be truncated away entirely -- overview questions ("what is
+        # proxima-runtime?") answered without consulting the index at all, and answered
+        # "not enough information" about documents that were sitting right there.
+        deterministic_budget = max(1, plan.final_limit // 3)
+        selected.extend(load_overview_chunks(workspace, limit=deterministic_budget))
     selected.extend(ranked)
     return dedupe_by_source(selected)[: plan.final_limit]
 

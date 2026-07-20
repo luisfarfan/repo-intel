@@ -9,6 +9,7 @@ from rich.table import Table
 from repo_intel.cli import config, notebooklm, obsidian, workspace
 from repo_intel.cli.setup import run_setup
 from repo_intel.application.use_cases import SddKnowledgeService
+from repo_intel.core.env import load_project_env
 from repo_intel.platform.workspace import WorkspaceResolutionError, resolve_workspace_path
 
 
@@ -37,17 +38,23 @@ def setup(
     ollama_url: str | None = None,
     embedding_model: str | None = None,
     llm_model: str | None = None,
-    openrouter_api_key: str | None = None,
     openrouter_model: str | None = None,
     non_interactive: bool = False,
 ) -> None:
-    """Configure portable global defaults for the repo-intel CLI."""
+    """Configure portable global defaults for the repo-intel CLI.
+
+    There is deliberately no `--openrouter-api-key` flag. A secret passed as an argv
+    element is readable by any local process via `ps` for the lifetime of the command
+    and is written verbatim into shell history. The interactive wizard prompts for it
+    with `hide_input=True`; for non-interactive use run
+    `repo-intel config env set OPENROUTER_API_KEY`, which writes ~/.repo-intel/.env
+    with 0600 permissions.
+    """
     run_setup(
         preset=preset,
         ollama_url=ollama_url,
         embedding_model=embedding_model,
         llm_model=llm_model,
-        openrouter_api_key=openrouter_api_key,
         openrouter_model=openrouter_model,
         non_interactive=non_interactive,
     )
@@ -64,15 +71,61 @@ def scan(target: str) -> None:
 
 
 @app.command()
-def ingest(target: str) -> None:
-    """Parse SDD docs, create semantic chunks, persist SQLite metadata, and index Chroma."""
+def ingest(
+    target: str,
+    full: Annotated[
+        bool,
+        typer.Option("--full", help="Rebuild every document instead of only changed ones."),
+    ] = False,
+    quiet: Annotated[
+        bool,
+        typer.Option("--quiet", help="One-line summary only; for hooks and scheduled runs."),
+    ] = False,
+) -> None:
+    """Reindex SDD docs into SQLite + Chroma. Incremental unless --full is passed."""
     service = service_for_target(target)
-    run = service.ingest()
-    console.print(f"[green]Ingestion run:[/green] {run.id}")
-    console.print(f"Repos: {run.repos_count}")
-    console.print(f"Docs: {run.docs_count}")
-    console.print(f"Chunks: {run.chunks_count}")
-    console.print(f"Embeddings: {run.embeddings_count}")
+    run = service.ingest(full=full)
+
+    if quiet:
+        console.print(
+            f"repo-intel {run.mode}: {run.documents_changed} changed, "
+            f"{run.documents_removed} removed, {run.embeddings_created} embedded "
+            f"({run.embeddings_count}/{run.chunks_count} indexed)"
+        )
+    else:
+        console.print(f"[green]Ingestion run:[/green] {run.id} [dim]({run.mode})[/dim]")
+        console.print(f"Repos: {run.repos_count}")
+        console.print(f"Docs: {run.docs_count}")
+        console.print(f"Chunks: {run.chunks_count}")
+        console.print(f"Embeddings: {run.embeddings_count}")
+        console.print(
+            f"[cyan]This run:[/cyan] {run.documents_changed} document(s) changed, "
+            f"{run.documents_removed} removed, {run.chunks_created} chunk(s) rebuilt, "
+            f"{run.embeddings_created} embedding(s) created"
+        )
+        if not run.documents_changed and not run.documents_removed:
+            if run.embeddings_created:
+                # No document changed, yet work happened: this is the retry path picking
+                # up chunks stranded by an earlier failure. Say so rather than printing
+                # the reassuring no-op line over a repair.
+                console.print(
+                    f"[dim]No document changed; recovered {run.embeddings_created} "
+                    "chunk(s) left unembedded by an earlier run.[/dim]"
+                )
+            else:
+                console.print("[dim]Index already up to date; nothing re-embedded.[/dim]")
+
+    # Coverage, not just this run's work. A gap here means chunks exist that retrieval
+    # cannot reach, which is invisible in every other counter -- "0 changed" reads as
+    # reassuring precisely when a hole is present.
+    if run.embeddings_count < run.chunks_count:
+        missing = run.chunks_count - run.embeddings_count
+        console.print(
+            f"[yellow]Warning:[/yellow] {missing} chunk(s) have no embedding and are "
+            "invisible to search. The next ingest retries them automatically; "
+            "`repo-intel ingest <target> --full` rebuilds everything."
+        )
+
     if run.errors:
         console.print("[yellow]Errors:[/yellow]")
         for error in run.errors:
@@ -209,6 +262,10 @@ def render_scan_table(repositories, documents) -> None:
 
 
 def main() -> None:
+    # Load ~/.repo-intel/.env and the project .env BEFORE any command builds a config,
+    # so REPO_INTEL_* overrides and provider API keys are visible to every subcommand
+    # (previously only `doctor` and the OpenRouter client loaded them).
+    load_project_env()
     app()
 
 

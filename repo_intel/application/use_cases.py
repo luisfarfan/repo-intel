@@ -46,34 +46,82 @@ class SddKnowledgeService:
         (self.workspace / ".repo-intel" / "exports").mkdir(parents=True, exist_ok=True)
         return path
 
-    def scan(self, persist: bool = True) -> tuple[list[RepositoryRecord], list[SddDocumentRecord]]:
+    def scan(
+        self,
+        persist: bool = True,
+        full: bool = False,
+    ) -> tuple[list[RepositoryRecord], list[SddDocumentRecord]]:
         repositories = discover_repositories(self.workspace, self.config)
-        documents = discover_sdd_documents(self.workspace, self.config, repositories)
+        reuse = {} if full else {doc.id: doc for doc in self.store.all_documents()}
+        documents = discover_sdd_documents(self.workspace, self.config, repositories, reuse=reuse)
         if persist:
-            self.store.upsert_scan(repositories, documents)
+            # sync_scan, never upsert_scan: the latter truncates chunks+embeddings, which
+            # would silently discard the whole vector index on every plain `scan`.
+            # Persisting here is safe for the *next* ingest because sync_scan only writes
+            # discovery metadata; `indexed_hash` -- the column the incremental gate reads
+            # -- is advanced by ingest alone. Scanning can therefore never mark a
+            # document as indexed when its text was never chunked.
+            self.store.sync_scan(repositories, documents, force=full)
             self.write_artifacts(repositories, documents, [])
         return repositories, documents
 
-    def ingest(self) -> IngestionRunRecord:
+    def ingest(self, full: bool = False) -> IngestionRunRecord:
+        """Index the workspace, re-embedding only what changed.
+
+        Incremental by default. The pipeline is gated at three levels, cheapest first:
+        1. git metadata is reused for files whose sha256 is unchanged (`reuse`);
+        2. only changed/removed documents are re-chunked and rewritten (`ScanDiff`);
+        3. only chunks with no embedding row for the active model are sent to Ollama.
+
+        Gate 2 compares against `indexed_hash`, which only this method advances and only
+        after the chunk rows are committed -- so no other command can convince ingest
+        that a document is done. Gate 3 asks the store rather than filtering this run's
+        chunks, which makes the pass self-healing: chunks stranded by an earlier failure
+        are picked up here even though their documents are long since unchanged.
+
+        `full=True` forces every stage to recompute, embeddings included, and is the
+        recovery path for a corrupted vector store.
+        """
         self.init()
         run = IngestionRunRecord(
             id=f"run:{uuid.uuid4()}",
             workspace=str(self.workspace),
             started_at=utcnow(),
+            mode="full" if full else "incremental",
         )
         self.store.create_run(run)
         errors: list[str] = []
         embeddings_count = 0
 
-        repositories, documents = self.scan(persist=True)
+        repositories = discover_repositories(self.workspace, self.config)
+        reuse = {} if full else {doc.id: doc for doc in self.store.all_documents()}
+        documents = discover_sdd_documents(self.workspace, self.config, repositories, reuse=reuse)
+        diff = self.store.sync_scan(repositories, documents, force=full)
+
         repo_by_id = {repo.id: repo for repo in repositories}
         chunks: list[SemanticChunkRecord] = []
         for document in documents:
+            if document.id not in diff.changed_document_ids:
+                continue
             repo = repo_by_id.get(document.repository_id)
             if not repo:
                 continue
             chunks.extend(chunk_document(self.config, repo, document))
-        self.store.replace_chunks(chunks)
+
+        self.store.replace_document_chunks(
+            diff.changed_document_ids | diff.removed_document_ids,
+            chunks,
+        )
+
+        # The chunk rows are committed, so these documents are genuinely in the index at
+        # this text. Only now may the incremental gate close on them.
+        self.store.mark_documents_indexed(
+            {
+                document.id: document.content_hash
+                for document in documents
+                if document.id in diff.changed_document_ids
+            }
+        )
 
         from repo_intel.enrichers.ollama_embeddings import OllamaEmbeddingClient
         from repo_intel.storage.vector import ChromaKnowledgeIndex
@@ -87,9 +135,39 @@ class SddKnowledgeService:
             self.config.storage.collection,
         )
 
+        # Drop vectors whose chunk is gone, otherwise retrieval keeps citing deleted
+        # text. The queue is durable and drained here, so a Chroma outage during one run
+        # is retried by the next instead of stranding the vectors forever.
+        orphaned_chunk_ids = self.store.pending_vector_deletions()
+        if orphaned_chunk_ids:
+            try:
+                vector_index.delete_chunks(sorted(orphaned_chunk_ids))
+                self.store.clear_pending_vector_deletions(orphaned_chunk_ids)
+            except Exception as exc:
+                errors.append(
+                    f"Vector prune of {len(orphaned_chunk_ids)} chunk(s) failed "
+                    f"(queued for retry): {exc}"
+                )
+
+        # Ask the STORE for what still needs embedding rather than filtering this run's
+        # chunks. Chunk ids are content-addressed, so unchanged text is skipped either
+        # way -- but only the store-derived set also picks up chunks whose embedding
+        # failed on an earlier run. Those documents are unchanged on every later scan,
+        # so a run-scoped set would never revisit them and their text would be missing
+        # from retrieval permanently.
+        # `--full` re-embeds unconditionally. Chunk ids are content-addressed, so
+        # re-chunking identical text recreates identical ids and every embedding row
+        # survives -- which used to make --full a full rescan that bought nothing and
+        # left no way to rebuild a corrupted or partially-written vector store.
+        pending = (
+            self.store.all_chunks()
+            if full
+            else self.store.chunks_missing_embeddings(self.config.embeddings.model)
+        )
+
         batch_size = 16
-        for start in range(0, len(chunks), batch_size):
-            batch = chunks[start : start + batch_size]
+        for start in range(0, len(pending), batch_size):
+            batch = pending[start : start + batch_size]
             try:
                 embeddings = embedder.embed_batch([chunk.text for chunk in batch])
                 vector_index.upsert_chunks(batch, embeddings)
@@ -106,17 +184,28 @@ class SddKnowledgeService:
                     )
                 embeddings_count += len(batch)
             except Exception as exc:
+                # Do NOT break. A single bad batch used to abort the run and silently
+                # leave every later chunk unembedded (one oversized chunk cost 808 of
+                # 7848 chunks, ~10% of the corpus, with only a one-line warning).
+                # Skip the batch, keep indexing, and surface it in run.errors.
                 errors.append(f"Embedding batch {start}-{start + len(batch)} failed: {exc}")
-                break
+                continue
 
+        totals = self.store.counts()
         run.finished_at = utcnow()
         run.repos_count = len(repositories)
         run.docs_count = len(documents)
-        run.chunks_count = len(chunks)
-        run.embeddings_count = embeddings_count
+        # Totals describe corpus coverage; the transient counters below describe this
+        # run's work. A no-op incremental run must report full coverage, not zero.
+        run.chunks_count = totals["chunks"]
+        run.embeddings_count = totals["embeddings"]
+        run.documents_changed = len(diff.changed_document_ids)
+        run.documents_removed = len(diff.removed_document_ids)
+        run.chunks_created = len(chunks)
+        run.embeddings_created = embeddings_count
         run.errors = errors
         self.store.finish_run(run)
-        self.write_artifacts(repositories, documents, chunks)
+        self.write_artifacts(repositories, documents, self.store.all_chunks())
         return run
 
     def query(self, question: str, limit: int = 8) -> list[dict]:
@@ -149,7 +238,7 @@ class SddKnowledgeService:
         return rows
 
     def ask(self, question: str, limit: int | None = None) -> dict:
-        from repo_intel.enrichers.ollama_chat import OllamaChatClient
+        from repo_intel.enrichers.factory import build_ask_client
 
         intent = classify_question(question)
         plan = build_retrieval_plan(intent, limit, self.config.llm.context_chunks)
@@ -204,12 +293,7 @@ class SddKnowledgeService:
             question=question,
             results=results,
         )
-        client = OllamaChatClient(
-            base_url=self.config.llm.base_url,
-            model=self.config.llm.model,
-            temperature=self.config.llm.temperature,
-            num_predict=self.config.llm.num_predict,
-        )
+        client = build_ask_client(self.config)
         answer = sanitize_answer(client.generate(prompt))
         sources = format_sources(results)
         cache_record = AskCacheRecord(
@@ -237,7 +321,7 @@ class SddKnowledgeService:
         }
 
     def brief(self, refresh_scan: bool = False) -> Path:
-        from repo_intel.enrichers.openrouter_chat import OpenRouterChatClient
+        from repo_intel.enrichers.factory import build_brief_client
 
         if refresh_scan:
             repositories, documents = self.scan(persist=True)
@@ -246,15 +330,25 @@ class SddKnowledgeService:
 
         context = build_brief_context(repositories, documents, self.config.brief.max_input_chars)
         prompt = build_brief_prompt(self.config.project_name, context)
-        client = OpenRouterChatClient(
-            model=self.config.brief.model,
-            api_key_env=self.config.brief.api_key_env,
-            site_url=self.config.brief.site_url,
-            app_name=self.config.brief.app_name,
-            temperature=self.config.brief.temperature,
-            max_tokens=self.config.brief.max_output_tokens,
-        )
-        brief_text = client.generate(prompt)
+        try:
+            brief_text = build_brief_client(self.config).generate(prompt)
+        except Exception as exc:
+            # brief.fallback_provider / fallback_model were declared and serialized but
+            # never read by any code path. They are honoured now: a failure of the
+            # primary provider (missing key, gateway down, model unavailable) retries
+            # once against the fallback instead of aborting the command.
+            fallback_provider = self.config.brief.fallback_provider
+            if not fallback_provider or fallback_provider == self.config.brief.provider:
+                raise
+            print(
+                f"brief: provider {self.config.brief.provider!r} failed ({exc}); "
+                f"retrying with fallback {fallback_provider!r}"
+            )
+            brief_text = build_brief_client(
+                self.config,
+                provider=fallback_provider,
+                model=self.config.brief.fallback_model,
+            ).generate(prompt)
 
         brief_dir = self.workspace / ".repo-intel" / "briefs"
         brief_dir.mkdir(parents=True, exist_ok=True)
